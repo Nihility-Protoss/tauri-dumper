@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use memmap2::Mmap;
 use object::{BinaryFormat, Object, ObjectSection, SectionKind};
@@ -42,7 +42,12 @@ struct Args {
 
 struct Dumper {
     mmap: Mmap,
-    data_section: SectionInfo,
+    // !for Windows PE,
+    // - .rdata section
+    // !for Mach-O
+    // - __DATA segment, __const section
+    // - __DATA_CONST segment, __const section
+    sections: Vec<SectionInfo>,
     binary_format: BinaryFormat,
 }
 
@@ -51,48 +56,64 @@ impl Dumper {
         let mmap = unsafe { Mmap::map(&file)? };
         let obj = object::File::parse(&*mmap)?;
         let binary_format = obj.format();
-        // TODO: support Mach-O format
-        if binary_format == BinaryFormat::MachO {
-            return Err(anyhow::anyhow!("Mach-O format is not supported"));
-        }
 
-        let matched_sections = obj
-            .sections()
-            .filter(|section| {
-                let section_name = section.name().expect("section name not found").to_string();
-                let matched_section = match binary_format {
-                    BinaryFormat::Pe => {
-                        section_name == ".rdata" && section.kind() == SectionKind::ReadOnlyData
-                    }
-                    _ => false,
-                };
-                matched_section
-            })
-            .collect::<Vec<_>>();
-        if matched_sections.len() != 1 {
-            return Err(anyhow::anyhow!("RDATA section not found or not unique"));
-        }
-
-        let ref data_section = matched_sections[0];
-        let data_section = SectionInfo {
-            virtual_address: data_section.address(),
-            file_offset: data_section.file_range().expect("file range not found").0,
-            size: data_section.size(),
+        // find .rdata or similar section
+        let sections = match binary_format {
+            BinaryFormat::Pe => obj
+                .sections()
+                .filter(|s| s.name() == Ok(".rdata") && s.kind() == SectionKind::ReadOnlyData)
+                .map(|s| SectionInfo {
+                    virtual_address: s.address(),
+                    file_offset: s.file_range().unwrap().0,
+                    size: s.size(),
+                })
+                .collect::<Vec<_>>(),
+            BinaryFormat::MachO => {
+                // fliter all sections with segment name,
+                // seg name is __TEXT or __DATA_CONST
+                // and section name is __const
+                obj.sections()
+                    .filter(|s| {
+                        s.segment_name() == Ok(Some("__TEXT"))
+                            || s.segment_name() == Ok(Some("__DATA_CONST"))
+                    })
+                    .filter(|s| s.name() == Ok("__const"))
+                    .map(|s| SectionInfo {
+                        virtual_address: s.address(),
+                        file_offset: s.file_range().unwrap().0,
+                        size: s.size(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            _ => unreachable!(),
         };
 
         Ok(Self {
             mmap,
-            data_section,
+            sections,
             binary_format,
         })
     }
 
     fn convert_rva_to_file_offset(&self, rva: u64) -> Result<u64> {
-        let section = &self.data_section;
+        // in mach-o, __TEXT,__const section inlcude assets content,
+        match self.binary_format {
+            BinaryFormat::MachO => {
+                // *Q: only need low 48 bits of the pointer
+                // *A: high 16 bits has another meaning in mach-o
+                return Ok(rva & 0xFFFFFFFFFFFF);
+            }
+            BinaryFormat::Pe => {
+                let Some(ref section) = self.sections.first() else {
+                    return Err(anyhow::anyhow!("RDATA section not found"));
+                };
 
-        if rva >= section.virtual_address && rva < section.virtual_address + section.size {
-            let section_offset = rva - section.virtual_address;
-            return Ok(section.file_offset + section_offset);
+                // check if rva is in the target section
+                if rva >= section.virtual_address && rva < section.virtual_address + section.size {
+                    return Ok(rva - section.virtual_address + section.file_offset);
+                }
+            }
+            _ => unreachable!(),
         }
 
         Err(anyhow::anyhow!("RVA is not in rdata section"))
@@ -100,21 +121,27 @@ impl Dumper {
 
     fn heuristic_search_assets(&self) -> Result<Vec<Asset>> {
         // get start offset and scan length
-        let (start_offset, scan_length) = match self.binary_format {
+        let (scan_start, scan_length) = match self.binary_format {
             BinaryFormat::Pe => {
-                let section = &self.data_section;
+                let section = self.sections.first().expect("RDATA section not found");
                 (section.file_offset as usize, section.size as usize)
             }
-            _ => unreachable!(),
+            BinaryFormat::MachO => {
+                // search range always in __DATA_CONST,__const section
+                let section = self
+                    .sections
+                    .last()
+                    .expect("__DATA_CONST section not found");
+                (section.file_offset as usize, section.size as usize)
+            }
+            _ => panic!("Unsupported binary format"),
         };
 
-        let end_offset = start_offset.saturating_add(scan_length);
+        let end_offset = scan_start.saturating_add(scan_length);
         assert!(end_offset <= self.mmap.len(), "end_offset is out of range");
-
-        // println!("Scanning from offset 0x{:x} to 0x{:x}", start_offset, end_offset);
-
+        
         let mut assets = Vec::new();
-        let mut offset = start_offset;
+        let mut offset = scan_start;
         let mut scan_step = 8; // TODO: detect PE/Mach-O file format to determine pointer size
         while offset + ASSET_HEADER_SIZE <= end_offset {
             if let Ok(asset) = self.parse_asset(offset) {
@@ -126,13 +153,12 @@ impl Dumper {
             offset += scan_step;
         }
 
-        // println!("Scan completed");
         Ok(assets)
     }
 
     fn parse_asset(&self, offset: usize) -> Result<Asset> {
         if offset + ASSET_HEADER_SIZE > self.mmap.len() {
-            return Err(anyhow::anyhow!("offset is out of range"));
+            return Err(anyhow!("offset is out of range"));
         }
 
         let chunk = &self.mmap[offset..offset + ASSET_HEADER_SIZE];
@@ -143,7 +169,7 @@ impl Dumper {
         let data_off = self.convert_rva_to_file_offset(header.data_ptr)?;
 
         if !self.validate_asset_pointers(name_off, header.name_len, data_off, header.data_size) {
-            return Err(anyhow::anyhow!("invalid asset pointers"));
+            return Err(anyhow!("invalid asset pointers"));
         }
 
         let name = self.retrieve_asset_name(name_off as usize, header.name_len as usize)?;
@@ -188,7 +214,7 @@ impl Dumper {
     fn retrieve_asset_name(&self, offset: usize, len: usize) -> Result<String> {
         let name = self.mmap[offset..offset + len].to_vec();
         if !name.iter().all(|&b| b.is_ascii()) {
-            return Err(anyhow::anyhow!("invalid name"));
+            return Err(anyhow!("invalid name"));
         }
         let name = String::from_utf8(name)?;
 
@@ -220,7 +246,7 @@ fn main() -> Result<()> {
     println!("Scanning completed. Found {} assets", assets.len());
 
     if assets.is_empty() {
-        return Err(anyhow::anyhow!("No assets found"));
+        return Err(anyhow!("No assets found"));
     }
 
     // dump assets
@@ -234,7 +260,7 @@ fn main() -> Result<()> {
             fs::create_dir_all(parent)?;
         }
 
-        println!("Dump asset: {}", asset.name);
+        println!("Dump asset: {}, size: {:#X}", asset.name, asset.data.len());
         fs::write(path, decompressed)?;
     }
 
