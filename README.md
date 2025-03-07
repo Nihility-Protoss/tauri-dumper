@@ -3,9 +3,26 @@
 > [!WARNING]
 > This tool is only for educational purposes. I am not responsible for any illegal use of this tool.
 
-A tool to dump assets from a Tauri app.
+Tauri Dumper is a tool to dump Tauri applications.
 
-**Only supports PE format for now.**
+## Support
+
+| OS | Architecture | File Type | Status |
+| --- | --- | --- | --- |
+| Windows | x86_64 | PE | ✅ |
+| Windows | x86 | PE | ❌ |
+| Windows | arm64 | PE | ❓ |
+| macOS | x86_64 | Mach-O | ✅ |
+| macOS | arm64 | Mach-O | ✅ |
+| Linux | x86_64 | ELF | ❌ |
+| Linux | x86 | ELF | ❌ |
+| Linux | arm64 | ELF | ❌ |
+
+Description:
+
+- ✅: Supported
+- ❌: Not Supported
+- ❓: Not Tested
 
 ## Installation
 
