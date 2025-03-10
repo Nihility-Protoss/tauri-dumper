@@ -1,6 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use memmap2::Mmap;
+use normalize_path::NormalizePath;
 use object::{BinaryFormat, Object, ObjectSection, SectionKind};
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
@@ -68,24 +69,20 @@ impl Dumper {
                     size: s.size(),
                 })
                 .collect::<Vec<_>>(),
-            BinaryFormat::MachO => {
-                // fliter all sections with segment name,
-                // seg name is __TEXT or __DATA_CONST
-                // and section name is __const
-                obj.sections()
-                    .filter(|s| {
-                        s.segment_name() == Ok(Some("__TEXT"))
-                            || s.segment_name() == Ok(Some("__DATA_CONST"))
-                    })
-                    .filter(|s| s.name() == Ok("__const"))
-                    .map(|s| SectionInfo {
-                        virtual_address: s.address(),
-                        file_offset: s.file_range().unwrap().0,
-                        size: s.size(),
-                    })
-                    .collect::<Vec<_>>()
-            }
-            _ => unreachable!(),
+            BinaryFormat::MachO => obj
+                .sections()
+                .filter(|s| {
+                    s.segment_name() == Ok(Some("__TEXT"))
+                        || s.segment_name() == Ok(Some("__DATA_CONST"))
+                })
+                .filter(|s| s.name() == Ok("__const"))
+                .map(|s| SectionInfo {
+                    virtual_address: s.address(),
+                    file_offset: s.file_range().unwrap().0,
+                    size: s.size(),
+                })
+                .collect::<Vec<_>>(),
+            other_format => unimplemented!("Unsupport format: {:?}", other_format),
         };
 
         Ok(Self {
@@ -96,56 +93,45 @@ impl Dumper {
     }
 
     fn convert_rva_to_file_offset(&self, rva: u64) -> Result<u64> {
-        // in mach-o, __TEXT,__const section inlcude assets content,
-        match self.binary_format {
-            BinaryFormat::MachO => {
-                // *Q: only need low 48 bits of the pointer
-                // *A: high 16 bits has another meaning in mach-o
-                return Ok(rva & 0xFFFFFFFFFFFF);
-            }
+        let rva = match self.binary_format {
+            BinaryFormat::MachO => Ok(rva & 0xFFFFFFFFFFFF), // low 48 bit
             BinaryFormat::Pe => {
-                let Some(ref section) = self.sections.first() else {
-                    return Err(anyhow::anyhow!("RDATA section not found"));
-                };
-
-                // check if rva is in the target section
+                let section = self.sections.first().context("")?;
                 if rva >= section.virtual_address && rva < section.virtual_address + section.size {
-                    return Ok(rva - section.virtual_address + section.file_offset);
+                    Ok(rva - section.virtual_address + section.file_offset)
+                } else {
+                    Err(anyhow!("invalid rva: {:#X}", rva))
                 }
             }
-            _ => unreachable!(),
-        }
+            other_format => unimplemented!("Unsupport format: {:?}", other_format),
+        };
 
-        Err(anyhow::anyhow!("RVA is not in rdata section"))
+        rva
     }
 
     fn heuristic_search_assets(&self) -> Result<Vec<Asset>> {
         // get start offset and scan length
         let (scan_start, scan_length) = match self.binary_format {
             BinaryFormat::Pe => {
-                let section = self.sections.first().expect("RDATA section not found");
+                let section = self.sections.first().context("empty sections")?;
                 (section.file_offset as usize, section.size as usize)
             }
             BinaryFormat::MachO => {
                 // search range always in __DATA_CONST,__const section
-                let section = self
-                    .sections
-                    .last()
-                    .expect("__DATA_CONST section not found");
+                let section = self.sections.last().context("empty sections")?;
                 (section.file_offset as usize, section.size as usize)
             }
-            _ => panic!("Unsupported binary format"),
+            other_format => unimplemented!("Unsupport format: {:?}", other_format),
         };
 
-        let end_offset = scan_start.saturating_add(scan_length);
-        assert!(end_offset <= self.mmap.len(), "end_offset is out of range");
-        
+        let end = scan_start.saturating_add(scan_length);
+        assert!(end <= self.mmap.len(), "scan end off is out of range");
+
         let mut assets = Vec::new();
         let mut offset = scan_start;
-        let mut scan_step = 8; // TODO: detect PE/Mach-O file format to determine pointer size
-        while offset + ASSET_HEADER_SIZE <= end_offset {
+        let mut scan_step = 8;
+        while offset + ASSET_HEADER_SIZE <= end {
             if let Ok(asset) = self.parse_asset(offset) {
-                // println!("Found asset at offset 0x{:x}: {}", offset, String::from_utf8_lossy(&asset.name));
                 assets.push(asset);
                 scan_step = ASSET_HEADER_SIZE;
             }
@@ -255,6 +241,12 @@ fn main() -> Result<()> {
 
         // remove starts with /
         let path = Path::new(&args.output).join(&asset.name[1..]);
+
+        // sanitize path
+        if !path.normalize().starts_with(&args.output) {
+            return Err(anyhow!("Path traversal found: {:?}", path));
+        }
+
         // create parent directory if not exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
