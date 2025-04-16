@@ -1,11 +1,14 @@
 [package]
 name = "tauri-dumper"
-version = "0.1.4"
+version = "0.1.4-alpha"
 edition = "2021"
 authors = ["Mason Shi <fishilir@gmail.com>"]
 license = "MIT"
 description = "A tool to dump assets from a Tauri app"
 repository = "https://github.com/Mas0nShi/tauri-dumper"
+categories = ["security", "command-line-utilities"]
+exclude = [".cargo/*", ".github/*"]
+keywords = ["reverse-engineering", "tauri-application", "asset-decompressor", "asset-unpacker"]
 
 
 [[bin]]
